@@ -14,8 +14,7 @@ from sklearn.metrics import classification_report
 
 """
  * add:
- * git?
- * runnable in console or similar, to keep the xec env alive
+ * runnable in console or similar, to keep the exec env alive
  * save model between epochs?
  * 
  * add for test:
@@ -36,14 +35,15 @@ class CopepodImageSet(torch.utils.data.Dataset):
 	def __init__(self, root, loader, grayscale=False, transform_list=None):
 		super(CopepodImageSet, self).__init__()
 
-		class_dict = {"negative":0, "negative1":0, "copepod":1, "copepod1":1}
+		# class_dict = {"negative":0, "negative1":0, "copepod":1, "copepod1":1}
+		class_dict = {"negative":0, "copepod":1, "copepod1":1}
 		self.root = root
 		self.image_paths = datasets.DatasetFolder.make_dataset(
 			directory=root, 
 			class_to_idx=class_dict, 
 			extensions=("jpg",)
 		)
-		self.grayscale=grayscale
+		self.grayscale = grayscale
 		self.transform = transform_list
 		self.io_loader = loader
 		print("first image path:")
@@ -216,11 +216,13 @@ class CopepodNetwork(nn.Module):
 	def __init__(self):
 		super().__init__()
 		self.flatten = nn.Flatten()
-		self.conv1 = nn.Conv2d(1, 3, 5)
+		self.conv1 = nn.Conv2d(1, 8, 5)
 		self.pool = nn.MaxPool2d(2, 2)
-		self.conv2 = nn.Conv2d(3, 9, 5)
-		self.fc1 = nn.LazyLinear(120)
-		self.fc2 = nn.LazyLinear(84)
+		self.conv2 = nn.Conv2d(8, 16, 5)
+		self.conv3 = nn.Conv2d(16, 32, 5)
+		# self.fc = nn.LazyLinear(256)
+		self.fc1 = nn.LazyLinear(128)
+		self.fc2 = nn.LazyLinear(64)
 		self.fc3 = nn.LazyLinear(1)
 
 	def set_loss_fn(self, loss_fn):
@@ -231,9 +233,11 @@ class CopepodNetwork(nn.Module):
 
 	def forward(self, x):
 		x = x.float()
-		res = self.pool(nn.functional.relu(self.conv1(x)))
-		res = self.pool(nn.functional.relu(self.conv2(res)))
+		res = self.pool( nn.functional.relu( self.conv1(x) ) )
+		res = self.pool( nn.functional.relu(self.conv2(res)) )
+		res = self.pool( nn.functional.relu(self.conv3(res)) )
 		res = torch.flatten(res, 1)
+		# res = nn.functional.relu(self.fc(res) )
 		res = nn.functional.relu(self.fc1(res))
 		res = nn.functional.relu(self.fc2(res))
 		logits = self.fc3(res)
