@@ -10,11 +10,12 @@ import os
 from datetime import datetime
 from multiprocessing import freeze_support
 from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
 
 
 """
  * add:
- * runnable in console or similar, to keep the exec env alive
+ * early stopping
  * save model between epochs?
  * 
  * add for test:
@@ -23,7 +24,7 @@ from sklearn.metrics import classification_report
  * consider and find out:
  * use more/other parameters for training - accuracy, recall, f1?
  * different loss function?
- * different optimizer? *Adam?*
+ * different optimizer? turns out AdamW works well for the meantime
 """
 
 class CopepodImageSet(torch.utils.data.Dataset):
@@ -36,6 +37,7 @@ class CopepodImageSet(torch.utils.data.Dataset):
 		super(CopepodImageSet, self).__init__()
 
 		# class_dict = {"negative":0, "negative1":0, "copepod":1, "copepod1":1}
+		# class_dict = {"negative-images":0, "copepod-images":1}
 		class_dict = {"negative":0, "copepod":1, "copepod1":1}
 		self.root = root
 		self.image_paths = datasets.DatasetFolder.make_dataset(
@@ -51,9 +53,17 @@ class CopepodImageSet(torch.utils.data.Dataset):
 
 		self.image_ex = self.load(self.image_paths[0][0])
 		self.image_shape = self.image_ex.shape
+		self.image_dtype = self.image_ex.dtype
 
-		self.length = self._calc_length()
+		self._calc_length()
+		positives, negatives = self.count_labels()
+		print(f"positives = {positives}, negatives = {negatives}")
 		self.patches = {}
+
+	def count_labels(self):
+		positives = sum(l for _, l in self.image_paths)
+		negatives = len(self.image_paths) - positives
+		return positives, negatives
 
 	def load(self, path):
 		im = th.from_numpy(self.io_loader(path, as_gray=self.grayscale))
@@ -61,27 +71,35 @@ class CopepodImageSet(torch.utils.data.Dataset):
 		# print(f"image max={maxv:>3f}, min={minv:>3f}") # debug
 		return im.unsqueeze(0)
 
-
+	
 	# looks slow. find ways to make faster?
 	def _generate_image_patches(self, path):
-		results = [self.load(path)]
+		patches = [self.load(path)]
 		for trans, count in self.transform:
-				image_list = []
-				if count > 0:
-					# trans() returns single image
-					# call <count> times
-					for _ in range(count):
-						image_list += [trans(im) for im in results]
-				elif count == -1:
-					# trans() returns list of images
-					# attach the same label to each one
-					for image in results:
-						transformed = trans(image)
-						image_list += list(transformed)
-				# else ignore
+				image_list = _image_transform_to_list(patches, trans, count)
 
 				if len(image_list) > 0:
-					results = image_list
+					patches = image_list
+
+		return patches
+
+	# apply <transform> to <images>, <count> times
+	# if <count> == -1, instead apply <transfom> once
+	# for each image and concat the resulting lists
+	def _image_transform_to_list(images, transform, count):
+		results = []
+		if count > 0:
+			# trans() returns single image
+			# call <count> times for each image in <images>
+			for _ in range(count):
+				results += [trans(im) for im in images]
+		elif count == -1:
+			# trans() returns list of images
+			# call for each image in <images> and concat
+			for image in results:
+				transformed = trans(image)
+				results += list(transformed)
+		# else ignore
 
 		return results
 
@@ -89,7 +107,7 @@ class CopepodImageSet(torch.utils.data.Dataset):
 		print(f"image_paths = {len(self.image_paths)}")
 		self._calc_image_multiplier()
 		print(f"multiplier = {self.trans_multiplier}")
-		return len(self.image_paths) * self.trans_multiplier
+		self.length = len(self.image_paths) * self.trans_multiplier
 
 	def _calc_image_multiplier(self):
 		print("calc multiplier")
@@ -215,7 +233,7 @@ class CopepodNetwork(nn.Module):
 	"""docstring for CopepodNetwork"""
 	def __init__(self):
 		super().__init__()
-		self.flatten = nn.Flatten()
+		# self.flatten = nn.Flatten()
 		self.conv1 = nn.Conv2d(1, 8, 5)
 		self.pool = nn.MaxPool2d(2, 2)
 		self.conv2 = nn.Conv2d(8, 16, 5)
@@ -224,6 +242,9 @@ class CopepodNetwork(nn.Module):
 		self.fc1 = nn.LazyLinear(128)
 		self.fc2 = nn.LazyLinear(64)
 		self.fc3 = nn.LazyLinear(1)
+
+		self.test_loss = []
+		self.train_loss = []
 
 	def set_loss_fn(self, loss_fn):
 		self.loss_fn = loss_fn
@@ -245,7 +266,9 @@ class CopepodNetwork(nn.Module):
 
 	def train_model(self, dataloader, device):
 		size = len(dataloader.dataset)
+		num_batches = len(dataloader)
 		print("train dataset size: ", size)
+		total_loss = 0
 		self.train()
 
 		for batch, (items, labels) in enumerate(dataloader):
@@ -261,10 +284,14 @@ class CopepodNetwork(nn.Module):
 			loss.backward()
 			self.optimizer.step()
 
+			total_loss += loss.item()
 			# print current status
 			if batch % 40 == 39:
 				loss_p, current = loss.item(), batch * len(items)
 				print(f"loss: {loss_p:>7f}  [{current:>5d}/{size:>5d}]")
+
+		total_loss /= num_batches
+		self.train_loss.append(total_loss)
 
 	def test_model(self, dataloader, device):
 		size = len(dataloader.dataset)
@@ -274,40 +301,63 @@ class CopepodNetwork(nn.Module):
 		pred_list = np.zeros(size, dtype=np.float64)
 		tag_list = np.zeros(size, dtype=np.float64)
 		i = 0
+
 		with torch.no_grad():
 			for item, label in dataloader:
 				item_num = label.size(dim=0)
 				item, label = item.to(device), label.to(device)
+
 				pred = self(item)
 				pred_perc = th.sigmoid(pred)
 				test_loss += self.loss_fn(pred, label.unsqueeze(1).float()).item()
-				pred_list[i:i+item_num] = pred_perc.cpu().numpy().reshape(item_num)
-				tag_list[i:i+item_num] = label.cpu().numpy().reshape(item_num)
+				pred_list[i:i+item_num] = pred_perc.squeeze().cpu().numpy()
+				tag_list[i:i+item_num] = label..squeeze().cpu().numpy()
 				i += item_num
     
 
 		test_loss /= num_batches
+		self.test_loss.append(test_loss)
 		print(f"Test  Avg loss: {test_loss:>8f} \n")
 		self.print_test_data(tag_list, pred_list)
 		
 
-	def print_test_data(self, tag_list, pred_list):
-		tag_arr = np.array(tag_list)
-		pred_arr = np.array(pred_list)
+	def print_test_data(self, tag_arr, pred_arr):
+		# tag_arr = np.array(tag_list)
+		# pred_arr = np.array(pred_list)
 		positive_preds = pred_arr[tag_arr == 1]
 		negative_preds = pred_arr[tag_arr == 0]
 
-		p_avg = np.average(positive_preds)
 		p_mean = np.mean(positive_preds)
+		p_std = np.std(positive_preds)
 		p_max, p_min = np.max(positive_preds), np.min(positive_preds)
-		n_avg = np.average(negative_preds)
 		n_mean = np.mean(negative_preds)
+		n_std = np.std(negative_preds)
 		n_max, n_min = np.max(negative_preds), np.min(negative_preds)
 
-		print(f"positive range:({p_min:>5f},{p_max:>5f}) avg:{p_avg:>5f} mean:{p_mean:>5f}")
-		print(f"negative range:({n_min:>5f},{n_max:>5f}) avg:{n_avg:>5f} mean:{n_mean:>5f}")
+		print(f"positive range:({p_min:>5f},{p_max:>5f}) mean:{p_mean:>5f} std:{p_std:>5f}")
+		print(f"negative range:({n_min:>5f},{n_max:>5f}) mean:{n_mean:>5f} std:{n_std:>5f}")
 
-		print(classification_report(tag_list, pred_list.round()))
+		print( classification_report(tag_list, pred_list.round(), digits=4) )
+		hist_range = (min(p_min, n_min), max(p_max, n_max))
+		graph_tests(positive_preds, negative_preds, hist_range)
+
+	def graph_tests(self, positive_preds, negative_preds, hist_range):
+		plt.figure(figsize=(18, 6))
+		epoch_range = range(1, len(self.test_loss) + 1)
+
+		plt.subplot(1, 2, 1)
+		plt.plot(epoch_range, self.test_loss, label="Test Loss")
+		plt.plot(epoch_range, self.train_loss, label="Train Loss")
+		plt.legend(loc='upper right')
+		plt.title("Train And Test Loss")
+
+		plt.subplot(1, 2, 2)
+		plt.xticks(np.arange(0, 1, step=0.05))
+		plt.hist([positive_preds, negative_preds], bins=180, alpha=0.5
+		 , label=['positives', 'negatives'], range=hist_range )
+		plt.legend(loc='upper right')
+		plt.title("Prediction Distribution")
+		plt.show()
 
 def time_now():
 	return datetime.now().strftime("%H:%M:%S")
@@ -320,7 +370,7 @@ def project_main():
 	item_height = 200
 	item_width = 260
 
-	# values after GrayScale() are in [0,1], 
+	# values in grayscale are in [0,1], 
 	# so no need to normalize
 	transform_list = [
 		(transforms.RandomRotation(180), 5),
@@ -346,21 +396,41 @@ def project_main():
 	 batch_size=batch_size, shuffle=False, num_workers=2)
 
 	model = CopepodNetwork().to(device)
+	dummy_item = th.zeros([batch_size, 1, item_height, item_width],
+  										dtype=image_ds.image_dtype).to(device)
+	model.forward(dummy_item)
 	print(model)
 
-	loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([0.65/0.35]).to(device))
-	optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
-	# optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+	# loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([0.65/0.35]).to(device))
+	positives, negatives = image_ds.count_labels()
+	loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([negatives/positives]).to(device))
+	# optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
+	optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
 	model.set_loss_fn(loss_fn)
 	model.set_optimizer(optimizer)
 
 	epochs = 50
-	for t in range(epochs):
+	for t in range(20):
 		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
 		model.train_model(train_loader, device)
 		print(f"testing at {time_now()}:")
 		model.test_model(test_loader, device)
-	print("done!")
+	print("done phase 1!")
+
+	for t in range(20, 40):
+		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
+		model.train_model(train_loader, device)
+		print(f"testing at {time_now()}:")
+		model.test_model(test_loader, device)
+	print("done phase 2!")
+
+	for t in range(40, epochs):
+		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
+		model.train_model(train_loader, device)
+		print(f"testing at {time_now()}:")
+		model.test_model(test_loader, device)
+	print("done phase 2!")
+
 	# try:
 	# 	epochs = 50
 	# 	for t in range(epochs):
