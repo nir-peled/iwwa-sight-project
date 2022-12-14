@@ -230,27 +230,18 @@ class PatchImage(object):
 
 
 class CopepodNetwork(nn.Module):
-	"""docstring for CopepodNetwork"""
 	def __init__(self):
 		super().__init__()
-		# self.flatten = nn.Flatten()
 		self.conv1 = nn.Conv2d(1, 8, 5)
 		self.pool = nn.MaxPool2d(2, 2)
 		self.conv2 = nn.Conv2d(8, 16, 5)
 		self.conv3 = nn.Conv2d(16, 32, 5)
-		# self.fc = nn.LazyLinear(256)
+		# self.fc = nn.LazyLinear(256) # unused
 		self.fc1 = nn.LazyLinear(128)
 		self.fc2 = nn.LazyLinear(64)
 		self.fc3 = nn.LazyLinear(1)
 
-		self.test_loss = []
-		self.train_loss = []
-
-	def set_loss_fn(self, loss_fn):
-		self.loss_fn = loss_fn
-
-	def set_optimizer(self, optimizer):
-		self.optimizer = optimizer
+		self.history = History()
 
 	def forward(self, x):
 		x = x.float()
@@ -263,6 +254,12 @@ class CopepodNetwork(nn.Module):
 		res = nn.functional.relu(self.fc2(res))
 		logits = self.fc3(res)
 		return logits
+
+	def set_loss_fn(self, loss_fn):
+		self.loss_fn = loss_fn
+
+	def set_optimizer(self, optimizer):
+		self.optimizer = optimizer
 
 	def train_model(self, dataloader, device):
 		size = len(dataloader.dataset)
@@ -291,7 +288,7 @@ class CopepodNetwork(nn.Module):
 				print(f"loss: {loss_p:>7f}  [{current:>5d}/{size:>5d}]")
 
 		total_loss /= num_batches
-		self.train_loss.append(total_loss)
+		self.history.add_train_loss(total_loss)
 
 	def test_model(self, dataloader, device):
 		size = len(dataloader.dataset)
@@ -311,12 +308,11 @@ class CopepodNetwork(nn.Module):
 				pred_perc = th.sigmoid(pred)
 				test_loss += self.loss_fn(pred, label.unsqueeze(1).float()).item()
 				pred_list[i:i+item_num] = pred_perc.squeeze().cpu().numpy()
-				tag_list[i:i+item_num] = label..squeeze().cpu().numpy()
+				tag_list[i:i+item_num] = label.squeeze().cpu().numpy()
 				i += item_num
-    
 
 		test_loss /= num_batches
-		self.test_loss.append(test_loss)
+		self.history.add_test_loss(test_loss)
 		print(f"Test  Avg loss: {test_loss:>8f} \n")
 		self.print_test_data(tag_list, pred_list)
 		
@@ -337,27 +333,65 @@ class CopepodNetwork(nn.Module):
 		print(f"positive range:({p_min:>5f},{p_max:>5f}) mean:{p_mean:>5f} std:{p_std:>5f}")
 		print(f"negative range:({n_min:>5f},{n_max:>5f}) mean:{n_mean:>5f} std:{n_std:>5f}")
 
-		print( classification_report(tag_list, pred_list.round(), digits=4) )
+		print( classification_report(tag_arr, pred_arr.round(), digits=4) )
 		hist_range = (min(p_min, n_min), max(p_max, n_max))
-		graph_tests(positive_preds, negative_preds, hist_range)
+		self.history.make_graphs(positive_preds, negative_preds, hist_range)
 
-	def graph_tests(self, positive_preds, negative_preds, hist_range):
-		plt.figure(figsize=(18, 6))
+class History():
+	"""docstring for History"""
+	def __init__(self):
+		self.test_loss = []
+		self.train_loss = []
+		self.test_accuracy = []
+
+	def add_train_loss(self, loss):
+		self.train_loss.append(loss)
+
+	def add_test_loss(self, loss):
+		self.test_loss.append(loss)
+
+	def add_test_accuracy(self, accuracy):
+		self.test_accuracy.append(accuracy)
+
+	def make_graphs(self, positive_preds, negative_preds, pred_range):
 		epoch_range = range(1, len(self.test_loss) + 1)
 
-		plt.subplot(1, 2, 1)
-		plt.plot(epoch_range, self.test_loss, label="Test Loss")
-		plt.plot(epoch_range, self.train_loss, label="Train Loss")
-		plt.legend(loc='upper right')
-		plt.title("Train And Test Loss")
+		# loss graph
+		fix, axes = plt.subplots(2, 2, figsize=(18, 12))
+		self.make_loss_graph(axes[0,0], epoch_range)
 
-		plt.subplot(1, 2, 2)
-		plt.xticks(np.arange(0, 1, step=0.05))
-		plt.hist([positive_preds, negative_preds], bins=180, alpha=0.5
-		 , label=['positives', 'negatives'], range=hist_range )
-		plt.legend(loc='upper right')
-		plt.title("Prediction Distribution")
+		# hist graph
+		self.make_hist_graph(axes[0,1], positive_preds, negative_preds, pred_range)
+
+		# accuracy graph
+		axes[1,0].sharex(axes[0,0])
+		self.make_accuracy_graph(axes[1,0], epoch_range, positive_preds, negative_preds)
+
+		fig.tight_layout()
 		plt.show()
+
+	def make_loss_graph(self, subplot, epoch_range):
+		subplot.plot(epoch_range, self.test_loss, label="Test Loss")
+		subplot.plot(epoch_range, self.train_loss, label="Train Loss")
+		subplot.legend(loc='upper right')
+		subplot.title("Train And Test Loss")
+
+	def make_hist_graph(self, subplot, positive_preds, negative_preds, pred_range):
+		subplot.set_xticks(np.arange(0, 1, step=0.05))
+		subplot.hist([positive_preds, negative_preds], bins=180, alpha=0.5
+		 , label=['positives', 'negatives'], range=pred_range )
+		subplot.legend(loc='upper right')
+		subplot.title("Test Prediction Distribution")
+
+	def make_accuracy_graph(self, subplot, epoch_range, positive_preds, negative_preds):
+		positive_correct = positive_preds.round().sum()
+		negative_correct = negative_preds.size - negative_preds.round().sum()
+		accuracy = (positive_correct + negative_correct) / (positive_preds.size + negative_preds.size)
+		self.test_accuracy.append(accuracy)
+		
+		subplot.plot(epoch_range, self.test_accuracy)
+		subplot.title("Test Accuracy")
+		
 
 def time_now():
 	return datetime.now().strftime("%H:%M:%S")
