@@ -2,6 +2,7 @@ import torch as th
 from torch import nn
 from torchvision import datasets
 import torchvision.transforms as transforms
+import torchvision.transforms.functional as transfuncs
 import torch.utils.data
 from skimage.io import imread
 import numpy as np
@@ -13,19 +14,6 @@ from sklearn.metrics import classification_report
 import matplotlib.pyplot as plt
 
 
-"""
- * add:
- * early stopping
- * save model between epochs?
- * 
- * add for test:
- * ? make and save graph of predictions by class ?
- *
- * consider and find out:
- * use more/other parameters for training - accuracy, recall, f1?
- * different loss function?
- * different optimizer? turns out AdamW works well for the meantime
-"""
 
 class CopepodImageSet(torch.utils.data.Dataset):
 	"""
@@ -36,16 +24,14 @@ class CopepodImageSet(torch.utils.data.Dataset):
 	def __init__(self, root, loader, grayscale=False, transform_list=None):
 		super(CopepodImageSet, self).__init__()
 
-		# class_dict = {"negative":0, "negative1":0, "copepod":1, "copepod1":1}
-		# class_dict = {"negative-images":0, "copepod-images":1}
-		class_dict = {"negative":0, "copepod":1, "copepod1":1}
+		class_dict = {"negative":0, "copepod":1, "copepod1":1, "copepod_maybe":1}
 		self.root = root
 		self.image_paths = datasets.DatasetFolder.make_dataset(
 			directory=root, 
 			class_to_idx=class_dict, 
-			extensions=("jpg",)
+			is_valid_file= lambda path: any(folder in path for folder in class_dict.keys()) and path.endswith("jpg")
 		)
-		self.grayscale = grayscale
+		self.grayscale=grayscale
 		self.transform = transform_list
 		self.io_loader = loader
 		print("first image path:")
@@ -55,7 +41,7 @@ class CopepodImageSet(torch.utils.data.Dataset):
 		self.image_shape = self.image_ex.shape
 		self.image_dtype = self.image_ex.dtype
 
-		self._calc_length()
+		self.length = self._calc_length()
 		positives, negatives = self.count_labels()
 		print(f"positives = {positives}, negatives = {negatives}")
 		self.patches = {}
@@ -71,35 +57,26 @@ class CopepodImageSet(torch.utils.data.Dataset):
 		# print(f"image max={maxv:>3f}, min={minv:>3f}") # debug
 		return im.unsqueeze(0)
 
-	
 	# looks slow. find ways to make faster?
 	def _generate_image_patches(self, path):
-		patches = [self.load(path)]
+		results = [self.load(path)]
 		for trans, count in self.transform:
-				image_list = _image_transform_to_list(patches, trans, count)
+				image_list = []
+				if count > 0:
+					# trans() returns single image
+					# call <count> times
+					for _ in range(count):
+						image_list += [trans(im) for im in results]
+				elif count == -1:
+					# trans() returns list of images
+					# attach the same label to each one
+					for image in results:
+						transformed = trans(image)
+						image_list += list(transformed)
+				# else ignore
 
 				if len(image_list) > 0:
-					patches = image_list
-
-		return patches
-
-	# apply <transform> to <images>, <count> times
-	# if <count> == -1, instead apply <transfom> once
-	# for each image and concat the resulting lists
-	def _image_transform_to_list(images, transform, count):
-		results = []
-		if count > 0:
-			# trans() returns single image
-			# call <count> times for each image in <images>
-			for _ in range(count):
-				results += [trans(im) for im in images]
-		elif count == -1:
-			# trans() returns list of images
-			# call for each image in <images> and concat
-			for image in results:
-				transformed = trans(image)
-				results += list(transformed)
-		# else ignore
+					results = image_list
 
 		return results
 
@@ -107,7 +84,7 @@ class CopepodImageSet(torch.utils.data.Dataset):
 		print(f"image_paths = {len(self.image_paths)}")
 		self._calc_image_multiplier()
 		print(f"multiplier = {self.trans_multiplier}")
-		self.length = len(self.image_paths) * self.trans_multiplier
+		return len(self.image_paths) * self.trans_multiplier
 
 	def _calc_image_multiplier(self):
 		print("calc multiplier")
@@ -126,7 +103,7 @@ class CopepodImageSet(torch.utils.data.Dataset):
 	def _get_patches(self, i):
 		path, label = self.image_paths[i]
 		patches = self._generate_image_patches(path)
-		patches = [(pch, label) for pch in patches]
+		patches = [(pch, label, path) for pch in patches]
 		# print(f"{os.getpid()}* patches length = {len(patches)}") # debug
 
 		offset = i * self.trans_multiplier
@@ -228,38 +205,65 @@ class PatchImage(object):
 		fixed_patch[:, :new_h, :new_w] = patch
 		return fixed_patch
 
+class AllDirectionsImage(object):
+	def __init__(self):
+		super(AllDirectionsImage, self).__init__()
+
+	def __call__(self, image):
+		results = [image]
+		vert_flipped_image = transfuncs.vflip(image)
+		results.append(vert_flipped_image)
+		results.append(transfuncs.hflip(image))
+		results.append(transfuncs.hflip(vert_flipped_image))
+
+		return results
+
+	def get_count(self, image_size):
+		return 4
+
 
 class CopepodNetwork(nn.Module):
+	"""docstring for CopepodNetwork"""
 	def __init__(self):
 		super().__init__()
+		# self.flatten = nn.Flatten()
 		self.conv1 = nn.Conv2d(1, 8, 5)
 		self.pool = nn.MaxPool2d(2, 2)
 		self.conv2 = nn.Conv2d(8, 16, 5)
 		self.conv3 = nn.Conv2d(16, 32, 5)
-		# self.fc = nn.LazyLinear(256) # unused
-		self.fc1 = nn.LazyLinear(128)
-		self.fc2 = nn.LazyLinear(64)
-		self.fc3 = nn.LazyLinear(1)
+		self.conv4 = nn.Conv2d(32, 64, 5)
+		self.conv5 = nn.Conv2d(64, 64, 5)
+		self.conv6 = nn.Conv2d(64, 64, 5)
+		self.fc = nn.LazyLinear(1024)
+		self.fc1 = nn.LazyLinear(512)
+		self.fc2 = nn.LazyLinear(256)
+		self.fc3 = nn.LazyLinear(128)
+		self.fc4 = nn.LazyLinear(64)
+		self.fc5 = nn.LazyLinear(1)
 
 		self.history = History()
-
-	def forward(self, x):
-		x = x.float()
-		res = self.pool( nn.functional.relu( self.conv1(x) ) )
-		res = self.pool( nn.functional.relu(self.conv2(res)) )
-		res = self.pool( nn.functional.relu(self.conv3(res)) )
-		res = torch.flatten(res, 1)
-		# res = nn.functional.relu(self.fc(res) )
-		res = nn.functional.relu(self.fc1(res))
-		res = nn.functional.relu(self.fc2(res))
-		logits = self.fc3(res)
-		return logits
 
 	def set_loss_fn(self, loss_fn):
 		self.loss_fn = loss_fn
 
 	def set_optimizer(self, optimizer):
 		self.optimizer = optimizer
+
+	def forward(self, x):
+		x = x.float()
+		res = self.pool( nn.functional.relu( self.conv1(x) ) )
+		res = self.pool( nn.functional.relu(self.conv2(res)) )
+		res = self.pool( nn.functional.relu(self.conv3(res)) )
+		res = self.pool( nn.functional.relu(self.conv4(res)) )
+		res = self.pool( nn.functional.relu(self.conv5(res)) )
+		res = torch.flatten(res, 1)
+		res = nn.functional.relu(self.fc(res))
+		res = nn.functional.relu(self.fc1(res))
+		res = nn.functional.relu(self.fc2(res))
+		res = nn.functional.relu(self.fc3(res))
+		res = nn.functional.relu(self.fc4(res))
+		logits = self.fc5(res)
+		return logits
 
 	def train_model(self, dataloader, device):
 		size = len(dataloader.dataset)
@@ -268,7 +272,7 @@ class CopepodNetwork(nn.Module):
 		total_loss = 0
 		self.train()
 
-		for batch, (items, labels) in enumerate(dataloader):
+		for batch, (items, labels, _) in enumerate(dataloader):
 			# initialize environment
 			items, labels = items.to(device), labels.to(device)
 			self.optimizer.zero_grad()
@@ -283,7 +287,7 @@ class CopepodNetwork(nn.Module):
 
 			total_loss += loss.item()
 			# print current status
-			if batch % 40 == 39:
+			if batch % 20 == 19:
 				loss_p, current = loss.item(), batch * len(items)
 				print(f"loss: {loss_p:>7f}  [{current:>5d}/{size:>5d}]")
 
@@ -300,11 +304,11 @@ class CopepodNetwork(nn.Module):
 		i = 0
 
 		with torch.no_grad():
-			for item, label in dataloader:
+			for items, label, _ in dataloader:
 				item_num = label.size(dim=0)
-				item, label = item.to(device), label.to(device)
+				items, label = items.to(device), label.to(device)
 
-				pred = self(item)
+				pred = self(items)
 				pred_perc = th.sigmoid(pred)
 				test_loss += self.loss_fn(pred, label.unsqueeze(1).float()).item()
 				pred_list[i:i+item_num] = pred_perc.squeeze().cpu().numpy()
@@ -357,7 +361,7 @@ class History():
 		epoch_range = range(1, len(self.test_loss) + 1)
 
 		# loss graph
-		fix, axes = plt.subplots(2, 2, figsize=(18, 12))
+		fig, axes = plt.subplots(2, 2, figsize=(18, 12))
 		self.make_loss_graph(axes[0,0], epoch_range)
 
 		# hist graph
@@ -374,14 +378,14 @@ class History():
 		subplot.plot(epoch_range, self.test_loss, label="Test Loss")
 		subplot.plot(epoch_range, self.train_loss, label="Train Loss")
 		subplot.legend(loc='upper right')
-		subplot.title("Train And Test Loss")
+		subplot.set_title("Train And Test Loss")
 
 	def make_hist_graph(self, subplot, positive_preds, negative_preds, pred_range):
 		subplot.set_xticks(np.arange(0, 1, step=0.05))
 		subplot.hist([positive_preds, negative_preds], bins=180, alpha=0.5
 		 , label=['positives', 'negatives'], range=pred_range )
 		subplot.legend(loc='upper right')
-		subplot.title("Test Prediction Distribution")
+		subplot.set_title("Test Prediction Distribution")
 
 	def make_accuracy_graph(self, subplot, epoch_range, positive_preds, negative_preds):
 		positive_correct = positive_preds.round().sum()
@@ -390,97 +394,75 @@ class History():
 		self.test_accuracy.append(accuracy)
 		
 		subplot.plot(epoch_range, self.test_accuracy)
-		subplot.title("Test Accuracy")
-		
+		subplot.set_title("Test Accuracy")
 
 def time_now():
 	return datetime.now().strftime("%H:%M:%S")
 
-def project_main():
-	freeze_support()
 
-	patch_height = 486
-	patch_width = 648
-	item_height = 200
-	item_width = 260
+original_height = 1944
+original_width = 2592
+patch_height = 972
+patch_width = 1296
+item_height = 200
+item_width = 260
 
-	# values in grayscale are in [0,1], 
-	# so no need to normalize
-	transform_list = [
-		(transforms.RandomRotation(180), 5),
-		(PatchImage((patch_height, patch_width), (patch_height, patch_width), True), -1), 
-		(transforms.Resize((item_height, item_width)), 1)
-	]
-
-	device = "cuda" if torch.cuda.is_available() else "cpu"
-	print(f"Using {device} device")
-
-	root = "C:\\Users\\User\\Desktop\\univercity\\telhai\\comp_vision\\project\\pictures"
-	image_ds = CopepodImageSet(root, imread, True, transform_list)
-	print(f"image set length = {len(image_ds)}")
-
-	train_size = int(len(image_ds) * 0.8)
-	test_size = len(image_ds) - train_size
-	train_ds, test_ds = torch.utils.data.random_split(image_ds, (train_size, test_size))
-
-	batch_size = 64
-	train_loader = torch.utils.data.DataLoader(train_ds,
-	 batch_size=batch_size, shuffle=True, num_workers=2)
-	test_loader =torch.utils.data. DataLoader(test_ds,
-	 batch_size=batch_size, shuffle=False, num_workers=2)
-
-	model = CopepodNetwork().to(device)
-	dummy_item = th.zeros([batch_size, 1, item_height, item_width],
-  										dtype=image_ds.image_dtype).to(device)
-	model.forward(dummy_item)
-	print(model)
-
-	# loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([0.65/0.35]).to(device))
-	positives, negatives = image_ds.count_labels()
-	loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([negatives/positives]).to(device))
-	# optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
-	optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-	model.set_loss_fn(loss_fn)
-	model.set_optimizer(optimizer)
-
-	epochs = 50
-	for t in range(20):
-		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
-		model.train_model(train_loader, device)
-		print(f"testing at {time_now()}:")
-		model.test_model(test_loader, device)
-	print("done phase 1!")
-
-	for t in range(20, 40):
-		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
-		model.train_model(train_loader, device)
-		print(f"testing at {time_now()}:")
-		model.test_model(test_loader, device)
-	print("done phase 2!")
-
-	for t in range(40, epochs):
-		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
-		model.train_model(train_loader, device)
-		print(f"testing at {time_now()}:")
-		model.test_model(test_loader, device)
-	print("done phase 2!")
-
-	# try:
-	# 	epochs = 50
-	# 	for t in range(epochs):
-	# 		print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
-	# 		model.train_model(train_loader, device)
-	# 		print(f"testing at {time_now()}:")
-	# 		model.test_model(test_loader, device)
-	# 	print("done!")
-	# except KeyboardInterrupt as e:
-	# 	print("interrupred")
-	# except Exception as e:
-	# 	raise e
-	# finally:
-	# 	return model
+# values in grayscale are in [0,1], 
+# need to normalize images?
+transform_list = [
+	# create more, different images
+	(transforms.RandomVerticalFlip(0.5), 2),
+	(transforms.RandomHorizontalFlip(0.5), 2),
+	(transforms.RandomCrop((patch_height, patch_width)), 4),
+	# (PatchImage((patch_height, patch_width), (patch_height, patch_width), True), -1), 
+	# normalize images (converting to uint8 and back because torch is annoying)
+	# seems to make it worse, so don't do it
+	# (transforms.ConvertImageDtype(th.uint8), 1 ),
+	# (transformFuncs.equalize, 1),
+	# (transforms.ConvertImageDtype(th.float64), 1),
 	
+	# not sure why this helps, looks like it just does -0.5
+	# (transforms.Normalize((0.5,), (1.0,)), 1), 
+	(transforms.Resize((item_height, item_width)), 1)
+]
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using {device} device")
 
-if __name__ == '__main__':
-	project_main()
+root = "/datasets"
+image_ds = CopepodImageSet(root, imread, True, transform_list)
+print(f"image set length = {len(image_ds)}")
+
+train_size = int(len(image_ds) * 0.8)
+test_size = len(image_ds) - train_size
+train_ds, test_ds = torch.utils.data.random_split(image_ds, (train_size, test_size))
+
+batch_size = 64
+train_loader = torch.utils.data.DataLoader(train_ds,
+ batch_size=batch_size, shuffle=True, num_workers=0)
+test_loader =torch.utils.data. DataLoader(test_ds,
+ batch_size=batch_size, shuffle=False, num_workers=0)
+
+model = CopepodNetwork().to(device)
+dummy_item = th.zeros([batch_size, 1, item_height, item_width],
+                      dtype=image_ds.image_dtype).to(device)
+model.forward(dummy_item)
+print(model)
+
+# loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([0.65/0.35]).to(device))
+# loss_fn = nn.BCEWithLogitsLoss()
+positives, negatives = image_ds.count_labels()
+loss_fn = nn.BCEWithLogitsLoss(pos_weight=th.tensor([negatives/positives]).to(device))
+# optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5) # if not working, try lr=1e-5
+# optimizer = th.optim.Adagrad(model.parameters(), lr=1e-5)
+model.set_loss_fn(loss_fn)
+model.set_optimizer(optimizer)
+
+epochs = 200
+for t in range(epochs):
+	print(f"Epoch {t+1} at {time_now()}\n-------------------------------")
+	model.train_model(train_loader, device)
+	print(f"testing at {time_now()}:")
+	model.test_model(test_loader, device)
+print("done!")
